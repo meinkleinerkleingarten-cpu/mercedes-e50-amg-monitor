@@ -1,3 +1,3 @@
 country,year,title,price_local,currency,price_eur,status,url,last_seen
-AT,1997,1997 | Mercedes-Benz E 50 AMG,,,,unverified,https://classic-trader.com/de/automobile/inserat/mercedes-benz/e-klasse/e-50-amg/1997/466508,2026-10-12
-NL,1996,1996 | Mercedes-Benz E 50 AMG,,,,unverified,https://classic-trader.com/de/automobile/inserat/mercedes-benz/e-klasse/e-50-amg/1996/457314,2026-10-12
+AT,1997,1997 | Mercedes-Benz E 50 AMG,19999.0,EUR,19999.0,unverified,https://classic-trader.com/de/automobile/inserat/mercedes-benz/e-klasse/e-50-amg/1997/466508,2026-10-12
+NL,1996,1996 | Mercedes-Benz E 50 AMG,44900.0,EUR,44900.0,unverified,https://classic-trader.com/de/automobile/inserat/mercedes-benz/e-klasse/e-50-amg/1996/457314,2026-10-12
