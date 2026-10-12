@@ -71,6 +71,9 @@ def main():
  for country,domains in SITES.items():
   for domain in domains:
    for item in discover(domain):
+    print("RESULT", country, domain,
+           repr(item["title"][:120]),
+           item["url"][:150])
     row=normalize(item,country)
     if row:
      accepted+=1
