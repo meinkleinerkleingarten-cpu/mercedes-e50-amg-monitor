@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Offline HTML market dashboard. Verified active listings only in price statistics."""
+import csv, datetime as dt, html, json, sqlite3, statistics
+from collections import defaultdict
+from pathlib import Path
+ROOT=Path(__file__).resolve().parent
+DB=ROOT/'listings.sqlite3'
+def h(v):return html.escape(str(v if v is not None else ''))
+def main():
+ if not DB.exists():
+  print('No database yet: run python bot.py');return
+ con=sqlite3.connect(DB);con.row_factory=sqlite3.Row
+ rows=[dict(r) for r in con.execute('SELECT * FROM listings ORDER BY country,year,title')]
+ history=[dict(r) for r in con.execute('SELECT * FROM snapshots ORDER BY snapshot_date')]
+ con.close()
+ # Do not treat unverified search-index entries as live vehicles.
+ active=[r for r in rows if r['status']=='verified_live' and r['price_eur'] is not None]
+ groups=defaultdict(list)
+ for r in active:groups[(r['country'],r['year'])].append(r['price_eur'])
+ summary=[]
+ for (country,year),prices in sorted(groups.items()):
+  summary.append({'country':country,'year':year,'n':len(prices),'mean':round(statistics.mean(prices)),'median':round(statistics.median(prices)),'min':round(min(prices)),'max':round(max(prices))})
+ # Snapshot data are candidate observations, not confirmed historic transaction prices.
+ data=json.dumps({'rows':rows,'summary':summary,'history':history},ensure_ascii=False).replace('</','<\\/')
+ page='''<!doctype html><html lang="de"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>E 50 AMG W210 | Weltweiter Marktmonitor</title><style>
+:root{font-family:system-ui,-apple-system,Segoe UI,sans-serif;color:#e9edf5;background:#0c1321}body{max-width:1300px;margin:auto;padding:28px}h1{font-size:clamp(28px,4vw,45px);margin-bottom:5px}h2{margin-top:36px}p,.muted{color:#aeb9cd}header{border-bottom:1px solid #344055;padding-bottom:24px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:22px 0}.stat{background:#182438;padding:18px;border-radius:12px}.stat strong{font-size:28px;display:block}.stat span{color:#aeb9cd}table{width:100%;border-collapse:collapse;background:#141f31;border-radius:12px;overflow:hidden}th,td{text-align:left;padding:11px;border-bottom:1px solid #2c394d}th{color:#aeb9cd;font-size:13px}a{color:#91c5ff}input,select{background:#1c2b40;border:1px solid #44526b;border-radius:7px;color:white;padding:10px;margin:5px 6px 12px 0} .tablewrap{overflow-x:auto}.pill{display:inline-block;border-radius:50px;padding:3px 9px;background:#33425c;font-size:12px}.warning{background:#302a1e;border:1px solid #77613a;border-radius:9px;padding:14px;color:#ffe4ae}.bar{background:#263b58;border-radius:6px;height:13px;overflow:hidden}.bar i{display:block;background:#74b8fc;height:100%}.tiny{font-size:12px}</style></head><body>
+<header><p class="muted">INTERNATIONALER OLDTIMER-MARKTMONITOR</p><h1>Mercedes-Benz E 50 AMG · W210</h1><p>1996 und 1997 getrennt · Angebotspreise in EUR · <span id="date"></span></p></header>
+<div class="warning">Suchtreffer sind zunächst <b>unbestätigte Kandidaten</b>. Nur manuell als <b>verified_live</b> bestätigte, aktive Inserate mit EUR-Preis fließen in die Statistik ein. Keine vollständige weltweite Marktabdeckung und keine Verkaufspreise.</div>
+<div class="stats"><div class="stat"><strong id="all">0</strong><span>Suchkandidaten</span></div><div class="stat"><strong id="live">0</strong><span>Bestätigte Angebote mit Preis</span></div><div class="stat"><strong id="countries">0</strong><span>Länder mit bestätigten Preisen</span></div><div class="stat"><strong id="median">–</strong><span>Median aller bestätigten Angebote</span></div></div>
+<h2>Durchschnittspreise pro Land und Baujahr</h2><div class="tablewrap"><table><thead><tr><th>Land</th><th>Jahr</th><th>Anzahl</th><th>Ø Angebotspreis</th><th>Median</th><th>Spanne</th><th>Vergleich</th></tr></thead><tbody id="summary"></tbody></table></div>
+<h2>Preisverlauf bestätigter Inserate</h2><p class="muted">Tageswerte werden nur dann angezeigt, wenn ein bestätigtes Inserat am jeweiligen Tag erneut als Suchtreffer beobachtet wurde. Kein Beleg für fortdauernde Verfügbarkeit.</p><div id="trend"></div>
+<h2>Alle gefundenen Kandidaten</h2><p>Jeden Eintrag vor Verwendung auf Originalmodell, Baujahr, Preis, Angebotsstatus und Dubletten prüfen.</p><div><input id="search" placeholder="Titel, Land, URL durchsuchen" aria-label="Suchen"><select id="year"><option value="">Beide Baujahre</option><option>1996</option><option>1997</option></select><select id="status"><option value="">Alle Status</option><option value="unverified">Unbestätigt</option><option value="verified_live">Bestätigt aktiv</option><option value="inactive">Inaktiv</option><option value="sold">Verkauft</option><option value="duplicate">Dublette</option><option value="rejected">Ausgeschlossen</option></select></div><div class="tablewrap"><table><thead><tr><th>Land</th><th>Jahr</th><th>Inserat</th><th>Preis</th><th>Status</th><th>Zuletzt gefunden</th></tr></thead><tbody id="listings"></tbody></table></div>
+<p class="muted tiny">Dashboard wird lokal aus SQLite erzeugt. Quellen sind externe Anzeigenlinks. FX-Umrechnungen müssen auf dokumentierten Kursen beruhen.</p>
+<script id="payload" type="application/json">__DATA__</script><script>
+const D=JSON.parse(document.getElementById('payload').textContent),eur=n=>n==null?'–':new Intl.NumberFormat('de-DE',{style:'currency',currency:'EUR',maximumFractionDigits:0}).format(n),esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const priced=D.rows.filter(x=>x.status==='verified_live'&&x.price_eur!=null),values=priced.map(x=>x.price_eur).sort((a,b)=>a-b),med=values.length?(values[Math.floor((values.length-1)/2)]+values[Math.floor(values.length/2)])/2:null;
+document.getElementById('date').textContent=new Date().toLocaleDateString('de-DE');document.getElementById('all').textContent=D.rows.length;document.getElementById('live').textContent=priced.length;document.getElementById('countries').textContent=new Set(priced.map(x=>x.country)).size;document.getElementById('median').textContent=eur(med);
+const max=Math.max(1,...D.summary.map(x=>x.mean));document.getElementById('summary').innerHTML=D.summary.length?D.summary.map(x=>`<tr><td>${esc(x.country)}</td><td>${x.year}</td><td>${x.n}</td><td>${eur(x.mean)}</td><td>${eur(x.median)}</td><td>${eur(x.min)} – ${eur(x.max)}</td><td><div class="bar"><i style="width:${100*x.mean/max}%"></i></div></td></tr>`).join(''):'<tr><td colspan="7">Noch keine verifizierten aktiven Angebote mit umgerechnetem Preis.</td></tr>';
+function render(){const q=document.getElementById('search').value.toLowerCase(),year=document.getElementById('year').value,status=document.getElementById('status').value;const r=D.rows.filter(x=>(!year||String(x.year)===year)&&(!status||x.status===status)&&[x.country,x.title,x.url].join(' ').toLowerCase().includes(q));document.getElementById('listings').innerHTML=r.map(x=>`<tr><td>${esc(x.country)}</td><td>${x.year}</td><td><a href="${esc(x.url)}" target="_blank" rel="noopener noreferrer">${esc(x.title)}</a></td><td>${x.price_eur==null?esc(x.price_local??'–')+' '+esc(x.currency):eur(x.price_eur)}</td><td><span class="pill">${esc(x.status)}</span></td><td>${esc(x.last_seen)}</td></tr>`).join('')||'<tr><td colspan="6">Keine passenden Treffer.</td></tr>'}for(const id of ['search','year','status'])document.getElementById(id).addEventListener('input',render);render();
+const ids=new Set(priced.map(x=>x.id));const history=D.history.filter(x=>ids.has(x.id)&&x.price_eur!=null);const byDate={};for(const s of history)(byDate[s.snapshot_date]??=[]).push(s.price_eur);document.getElementById('trend').innerHTML=Object.keys(byDate).sort().map(date=>{const v=byDate[date],avg=v.reduce((a,b)=>a+b,0)/v.length;return `<p>${esc(date)} · ${v.length} beobachtete Inserate · Mittelwert ${eur(avg)}</p>`}).join('')||'<p class="muted">Noch keine Preisbeobachtungen bestätigter Inserate vorhanden.</p>';
+</script></body></html>'''
+ (ROOT/'dashboard.html').write_text(page.replace('__DATA__',data),encoding='utf-8')
+ print('Wrote dashboard.html:',len(rows),'candidates,',len(active),'verified priced offers')
+if __name__=='__main__':main()
