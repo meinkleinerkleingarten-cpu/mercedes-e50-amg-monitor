@@ -1,54 +1,96 @@
 #!/usr/bin/env python3
-"""Direct, respectful portal discovery. No search-engine API, login or bypass."""
-import csv, datetime as dt, hashlib, json, os, re, sqlite3, statistics, sys, time
+"""E50 AMG V4.2: cautious multi-portal discovery; no login or access bypass."""
+import csv
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import statistics
+import sys
+import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.robotparser import RobotFileParser
+
 import requests
 from bs4 import BeautifulSoup
 from price_extract import extract_price
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'listings.sqlite3'
-HEADERS = {'User-Agent': 'E50AMGMarketResearch/4.1 (+personal noncommercial market monitor; contact via repository)', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
-MODEL = re.compile(r'(?<![\w])(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
+USER_AGENT = 'E50AMGMarketResearch/4.2 (+personal noncommercial market monitor; contact via GitHub repository)'
+HEADERS = {'User-Agent': USER_AGENT, 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
+MODEL = re.compile(r'(?<!\w)(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
 BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
 YEARS = re.compile(r'(?<!\d)(1996|1997)(?!\d)')
-EURO = re.compile(r'(?:€\s*|\bEUR\s*)(\d[\d.\s\u00a0\u202f,]{2,12})|([\d.\s\u00a0\u202f,]{3,13}\d)\s*(?:€|\bEUR\b)', re.I)
-# Only routes that have been observed publicly; additional portals can be added once their access is verified.
-SOURCES = [
- {'name':'Classic Trader W210','host':'classic-trader.com','url':'https://www.classic-trader.com/de/automobile/suche/mercedes-benz/e-klasse/w-210', 'link_regex':r'/automobile/inserat/[^?#]+/e-50-amg/(?:1996|1997)/\d+'},
- {'name':'Car & Classic E50 AMG','host':'carandclassic.com','url':'https://www.carandclassic.com/list/31/e50%20amg/', 'link_regex':r'/car/C\d+'},
- {'name':'AutoScout24 E50 (experimental)','host':'autoscout24.com','url':'https://www.autoscout24.com/lst/mercedes-benz/e-50-amg', 'link_regex':r'/offers/[a-z0-9-]+'},
- {'name':'mobile.de E50 (experimental)','host':'mobile.de','url':'https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&dam=false&isSearchRequest=true&ms=17200%3B%3B%3BE%2050%20AMG', 'link_regex':r'/(?:auto-inserat|fahrzeuge/details)/[^?#]+'},
- {'name':'Car & Classic model','host':'carandclassic.com','url':'https://www.carandclassic.com/au/cars/mercedes/e-class/e50-amg', 'link_regex':r'/car/C\d+'},
-]
 COUNTRY_NAMES = {'Deutschland':'DE','Germany':'DE','Niederlande':'NL','Netherlands':'NL','Österreich':'AT','Austria':'AT','Frankreich':'FR','France':'FR','Schweden':'SE','Sweden':'SE','Schweiz':'CH','Switzerland':'CH','Belgien':'BE','Belgium':'BE','Polen':'PL','Poland':'PL','Italien':'IT','Italy':'IT','Spanien':'ES','Spain':'ES','Tschechien':'CZ','Czechia':'CZ','United Kingdom':'GB','Großbritannien':'GB','Japan':'JP','Australia':'AU','Australien':'AU','USA':'US'}
 
+# Experimental URLs are starting points, NOT verified APIs or promises of access.
+# Access restrictions are respected; disabled sources are documented rather than probed.
+SOURCES = [
+ {'name':'Classic Trader W210', 'host':'classic-trader.com', 'url':'https://www.classic-trader.com/de/automobile/suche/mercedes-benz/e-klasse/w-210', 'link_regex':r'/automobile/inserat/[^?#]+/e-50-amg/(?:1996|1997)/\d+', 'enabled':True},
+ {'name':'Kleinanzeigen DE (experimental)', 'host':'kleinanzeigen.de', 'url':'https://www.kleinanzeigen.de/s-autos/mercedes-e50-amg/k0c216', 'link_regex':r'/s-anzeige/[^?#]+/\d+-216-[^/?#]+', 'enabled':True},
+ {'name':'Marktplaats NL (experimental)', 'host':'marktplaats.nl', 'url':'https://www.marktplaats.nl/q/mercedes+e50+amg/', 'link_regex':r'/v/auto.s/[^?#]+/m\d+', 'enabled':True},
+ {'name':'Willhaben AT (experimental)', 'host':'willhaben.at', 'url':'https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?keyword=E%2050%20AMG', 'link_regex':r'/iad/gebrauchtwagen/d/[^?#]+-\d+', 'enabled':True},
+ {'name':'OTOMOTO PL (experimental)', 'host':'otomoto.pl', 'url':'https://www.otomoto.pl/osobowe/q-e-50-amg', 'link_regex':r'/osobowe/oferta/[^?#]+-ID[a-zA-Z0-9]+', 'enabled':True},
+ {'name':'AutoScout24 E50 (experimental)', 'host':'autoscout24.com', 'url':'https://www.autoscout24.com/lst/mercedes-benz/e-50-amg', 'link_regex':r'/offers/[a-z0-9-]+', 'enabled':True},
+ {'name':'Car & Classic (403 previously)', 'host':'carandclassic.com', 'url':'https://www.carandclassic.com/list/31/e50%20amg/', 'link_regex':r'/car/C\d+', 'enabled':False},
+ {'name':'mobile.de (awaiting API)', 'host':'mobile.de', 'url':'https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&dam=false&isSearchRequest=true&ms=17200%3B%3B%3BE%2050%20AMG', 'link_regex':r'/(?:auto-inserat|fahrzeuge/details)/[^?#]+', 'enabled':False},
+]
+
 def canonical(url):
- p=urlsplit(url); return urlunsplit((p.scheme.lower(),(p.hostname or '').lower().removeprefix('www.'),p.path.rstrip('/') or '/','',''))
+ p=urlsplit(url)
+ return urlunsplit((p.scheme.lower(),(p.hostname or '').lower().removeprefix('www.'),p.path.rstrip('/') or '/','',''))
 
 def permitted_host(url,host):
- h=(urlsplit(url).hostname or '').lower(); return h==host or h.endswith('.'+host)
+ h=(urlsplit(url).hostname or '').lower()
+ return h==host or h.endswith('.'+host)
+
+ROBOTS = {}
+def robots_allowed(session,url,host):
+ """Fail closed if robots.txt cannot be checked; cache per origin."""
+ p=urlsplit(url); origin=f'{p.scheme}://{p.netloc}'
+ if origin not in ROBOTS:
+  robots_url=origin+'/robots.txt'
+  try:
+   r=session.get(robots_url,timeout=15,allow_redirects=False)
+   if r.status_code != 200:
+    ROBOTS[origin]=(False,'robots_http_'+str(r.status_code))
+   else:
+    rp=RobotFileParser();rp.parse(r.text.splitlines());ROBOTS[origin]=(rp,'ok')
+  except requests.RequestException as e:
+   ROBOTS[origin]=(False,'robots_unavailable_'+type(e).__name__)
+ rp,reason=ROBOTS[origin]
+ if rp is False:return False,reason
+ return (rp.can_fetch(USER_AGENT,url),'robots_allowed' if rp.can_fetch(USER_AGENT,url) else 'robots_disallowed')
 
 def fetch(session,url,host):
- if not permitted_host(url,host): raise ValueError('off-domain URL blocked')
- r=session.get(url,timeout=22,allow_redirects=True)
- if not permitted_host(r.url,host): raise ValueError('redirect off-domain blocked')
- if r.status_code in (401,403,429): raise RuntimeError('access_restricted_'+str(r.status_code))
+ if not permitted_host(url,host):raise ValueError('off_domain_url')
+ allowed,reason=robots_allowed(session,url,host)
+ if not allowed:raise RuntimeError(reason)
+ r=session.get(url,timeout=22,allow_redirects=False)
+ if r.status_code in (301,302,303,307,308):
+  redirect=urljoin(url,r.headers.get('Location',''))
+  if not permitted_host(redirect,host):raise ValueError('redirect_off_domain')
+  allowed,reason=robots_allowed(session,redirect,host)
+  if not allowed:raise RuntimeError(reason)
+  r=session.get(redirect,timeout=22,allow_redirects=False)
+ if r.status_code in (401,403,429):raise RuntimeError('access_restricted_'+str(r.status_code))
  r.raise_for_status()
  if 'html' not in r.headers.get('content-type','text/html').lower():raise ValueError('non_html')
  return BeautifulSoup(r.text,'html.parser')
 
 def discover(soup,source):
- result={}; rx=re.compile(source['link_regex'],re.I)
+ found={};rx=re.compile(source['link_regex'],re.I)
  for a in soup.select('a[href]'):
   u=canonical(urljoin(source['url'],a['href']))
-  if permitted_host(u,source['host']) and rx.search(urlsplit(u).path):result[u]=a.get_text(' ',strip=True)
- return result
+  if permitted_host(u,source['host']) and rx.search(urlsplit(u).path):found[u]=a.get_text(' ',strip=True)
+ return found
 
 def extract_country(soup):
- # Prefer actual vehicle location, never portal TLD or interface language.
  for im in soup.select('img[alt],img[title]'):
   desc=(im.get('alt','')+' '+im.get('title','')).strip()
   m=re.search(r'\b(DE|NL|AT|FR|SE|CH|BE|PL|IT|ES|CZ|GB|JP|AU|US)\s*flag\b',desc,re.I)
@@ -58,22 +100,11 @@ def extract_country(soup):
   if re.search(r'(?:Standort|Location|Ort|Localisation|Pays|Country)\s*:?\s*'+re.escape(name)+r'\b',text,re.I):return code
  return None
 
-def parse_euro(text):
- for m in EURO.finditer(text):
-  raw=(m.group(1) or m.group(2) or '').replace('\u00a0','').replace('\u202f','').replace(' ','')
-  # The E50 market has no credible price below 3k or above 500k. Commas are decimal only after 2 digits.
-  raw=re.sub(r'[,\.]\d{2}$','',raw)
-  digits=re.sub(r'\D','',raw)
-  if digits and 3000<=int(digits)<=500000:return int(digits)
- return None
-
 def extract(url,soup):
- title=(soup.title.get_text(' ',strip=True) if soup.title else '')
- h1=soup.find('h1'); heading=h1.get_text(' ',strip=True) if h1 else title
+ title=soup.title.get_text(' ',strip=True) if soup.title else ''
+ h1=soup.find('h1');heading=h1.get_text(' ',strip=True) if h1 else title
  text=soup.get_text(' ',strip=True)
- # Only confirm the model from page heading/title, not incidental recommendations.
  if not MODEL.search(heading+' '+title) or BAD.search(heading+' '+title):return None,'wrong_model'
- # Prefer the model title for year; first registration can differ from manufacture year.
  title_years=set(map(int,YEARS.findall(heading+' '+title)))
  year=next(iter(title_years)) if len(title_years)==1 else None
  if year is None:
@@ -81,10 +112,12 @@ def extract(url,soup):
    m=re.search(re.escape(label)+r'\s*:?\s*(1996|1997)',text,re.I)
    if m:year=int(m.group(1));break
  if year not in (1996,1997):return None,'unknown_year'
- # Detect explicit removed/sold messages; do not assert live solely from HTTP 200.
  inactive=bool(re.search(r'(?:this listing has now been removed|dieses inserat wurde.*entfernt|this advert has been removed|sold or otherwise removed)',text,re.I))
- price,price_method=extract_price(soup)
- print('PRICE_CHECK',price_method,price,url,flush=True)
+ price,method=extract_price(soup)
+ # Never mistake Polish zloty for EUR. Currency conversion comes in a later release.
+ if permitted_host(url,'otomoto.pl'):
+  price=None;method='currency_unverified_PLN_skipped'
+ print('PRICE_CHECK',method,price,url,flush=True)
  country=extract_country(soup)
  return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country or '??','year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':'inactive' if inactive else 'unverified','last_seen':dt.date.today().isoformat()},'accepted'
 
@@ -93,7 +126,6 @@ def init(con):
  con.execute('CREATE TABLE IF NOT EXISTS snapshots (snapshot_date TEXT,id TEXT,price_eur REAL,PRIMARY KEY(snapshot_date,id))')
 
 def save(con,row):
- # Do not overwrite human review status, except for explicit inactive notice.
  con.execute('''INSERT INTO listings VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen)
  ON CONFLICT(id) DO UPDATE SET country=CASE WHEN excluded.country='??' THEN listings.country ELSE excluded.country END,
  year=COALESCE(excluded.year,listings.year),title=excluded.title,
@@ -118,10 +150,13 @@ def exports(con):
 def main():
  con=sqlite3.connect(DB);init(con)
  session=requests.Session();session.headers.update(HEADERS)
- counters=Counter(); urls={}
+ counters=Counter();urls={}
  for source in SOURCES:
+  if not source['enabled']:
+   print('PORTAL_SKIPPED',source['name'],'disabled_pending_permission',flush=True)
+   continue
   try:
-   soup=fetch(session,source['url'],source['host']); found=discover(soup,source)
+   soup=fetch(session,source['url'],source['host']);found=discover(soup,source)
    print('PORTAL',source['name'],'candidate_links',len(found),flush=True)
    counters['sources_ok']+=1;urls.update({u:source for u in found})
   except Exception as e:
@@ -137,7 +172,6 @@ def main():
  con.commit();verified=exports(con)
  print('RUN_SUMMARY',json.dumps(dict(counters),sort_keys=True),'stored',con.execute('SELECT COUNT(*) FROM listings').fetchone()[0],'verified_priced',verified,flush=True)
  con.close()
- # Fail clearly if no source could be read; 0 listings with readable sources is an honest empty result.
  return 1 if counters['sources_ok']==0 else 0
 
 if __name__=='__main__':sys.exit(main())
