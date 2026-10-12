@@ -1,96 +1,140 @@
 #!/usr/bin/env python3
-"""E50 AMG W210 discovery bot. Public search RSS, conservative validation, SQLite history."""
-import csv, datetime as dt, hashlib, html, json, os, re, sqlite3, statistics, urllib.parse, urllib.request, xml.etree.ElementTree as ET
+"""Direct, respectful portal discovery. No search-engine API, login or bypass."""
+import csv, datetime as dt, hashlib, json, os, re, sqlite3, statistics, sys, time
+from collections import Counter
 from pathlib import Path
-ROOT=Path(__file__).resolve().parent
-DB=ROOT/'listings.sqlite3'
-SITES={
-'DE':['mobile.de','classic-trader.com','kleinanzeigen.de'],
-'FR':['leboncoin.fr','occasion.largus.fr'],
-'NL':['marktplaats.nl','autouncle.nl','classic.com'],
-'GB':['carandclassic.com','collectingcars.com'],
-'SE':['blocket.se','minannons.se'],
-'AT':['willhaben.at'],
-'CH':['autoscout24.ch'],
-'PL':['otomoto.pl'],
-'CZ':['sauto.cz'],
-'IT':['subito.it'],
-'ES':['coches.net'],
-'JP':['goo-net-exchange.com','carsensor.net'],
-'US':['bringatrailer.com','classic.com'],
-'AU':['carsales.com.au']}
-CURRENCY={'DE':'EUR','FR':'EUR','NL':'EUR','GB':'GBP','SE':'SEK','AT':'EUR','CH':'CHF','PL':'PLN','CZ':'CZK','IT':'EUR','ES':'EUR','JP':'JPY','US':'USD','AU':'AUD'}
-# Optional manually provided FX rates: JSON e.g. {"SEK":0.09}; EUR always 1.
-FX={'EUR':1.0, **json.loads(os.getenv('FX_EUR_JSON','{}'))}
-UA='Mozilla/5.0 (compatible; E50AMGResearchBot/1.0; public-search-only)'
+from urllib.parse import urljoin, urlsplit, urlunsplit
+import requests
+from bs4 import BeautifulSoup
 
-def fetch(url):
- req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/rss+xml,application/xml,text/xml'})
- with urllib.request.urlopen(req,timeout=18) as resp: return resp.read()
+ROOT = Path(__file__).resolve().parent
+DB = ROOT / 'listings.sqlite3'
+HEADERS = {'User-Agent': 'E50AMGMarketResearch/4.0 (+personal noncommercial market monitor; contact via repository)', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
+MODEL = re.compile(r'(?<![\w])(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
+BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
+YEARS = re.compile(r'(?<!\d)(1996|1997)(?!\d)')
+EURO = re.compile(r'(?:€\s*|\bEUR\s*)(\d[\d.\s\u00a0\u202f,]{2,12})|([\d.\s\u00a0\u202f,]{3,13}\d)\s*(?:€|\bEUR\b)', re.I)
+# Only routes that have been observed publicly; additional portals can be added once their access is verified.
+SOURCES = [
+ {'name':'Classic Trader W210','host':'classic-trader.com','url':'https://www.classic-trader.com/de/automobile/suche/mercedes-benz/e-klasse/w-210', 'link_regex':r'/automobile/inserat/[^?#]+/e-50-amg/(?:1996|1997)/\d+'},
+ {'name':'Car & Classic E50 AMG','host':'carandclassic.com','url':'https://www.carandclassic.com/list/31/e50%20amg/', 'link_regex':r'/car/C\d+'},
+ {'name':'Car & Classic model','host':'carandclassic.com','url':'https://www.carandclassic.com/au/cars/mercedes/e-class/e50-amg', 'link_regex':r'/car/C\d+'},
+]
+COUNTRY_NAMES = {'Deutschland':'DE','Germany':'DE','Niederlande':'NL','Netherlands':'NL','Österreich':'AT','Austria':'AT','Frankreich':'FR','France':'FR','Schweden':'SE','Sweden':'SE','Schweiz':'CH','Switzerland':'CH','Belgien':'BE','Belgium':'BE','Polen':'PL','Poland':'PL','Italien':'IT','Italy':'IT','Spanien':'ES','Spain':'ES','Tschechien':'CZ','Czechia':'CZ','United Kingdom':'GB','Großbritannien':'GB','Japan':'JP','Australia':'AU','Australien':'AU','USA':'US'}
 
-def discover(domain):
- queries=[f'"E50 AMG" site:{domain}',f'"E 50 AMG" site:{domain}',f'"W210" "AMG" site:{domain}']
- found={}
- for q in queries:
-  url='https://www.bing.com/search?'+urllib.parse.urlencode({'q':q,'format':'rss'})
-  try:
-   root=ET.fromstring(fetch(url))
-   items=root.findall('./channel/item')
-   print('SEARCH',domain,repr(q),'results=',len(items))
-   for x in items:
-    item={'title':(x.findtext('title') or ''),'url':(x.findtext('link') or ''),'snippet':(x.findtext('description') or '')}
-    if item['url']:found[item['url']]=item
-  except Exception as e:
-   print('DISCOVERY_FAILED',domain,repr(q),type(e).__name__,str(e)[:160])
- print('DOMAIN_TOTAL',domain,len(found))
- return list(found.values())
+def canonical(url):
+ p=urlsplit(url); return urlunsplit((p.scheme.lower(),(p.hostname or '').lower().removeprefix('www.'),p.path.rstrip('/') or '/','',''))
 
-def normalize(item,country):
- text=html.unescape(re.sub('<[^>]+>',' ',item['title']+' '+item['snippet']))
- if not (re.search(r'\bE\s*[- ]?\s*50\s*AMG\b',text,re.I) or re.search(r'\bAMG\s*E\s*[- ]?\s*50\b',text,re.I)):return None
- if re.search(r'\b(E\s*55|E\s*500|E\s*53)\b',text,re.I):return None
- years=set(int(y) for y in re.findall(r'\b(1996|1997)\b',text))
- # Ambiguous 1996 OR 1997 search result must not be assigned to either year.
- year=next(iter(years)) if len(years)==1 else None
- # Preserve plausible listings without a confirmed year for manual review.
- price=None;currency=CURRENCY[country]
- patterns=[r'(?<!\d)(\d{1,3}(?:[. ,]\d{3})+|\d{4,7})\s*(?:€|EUR)\b?',r'(?:€|EUR)\s*(\d{1,3}(?:[. ,]\d{3})+|\d{4,7})'] if currency=='EUR' else []
- for p in patterns:
-  m=re.search(p,text,re.I)
-  if m:
-   val=int(re.sub(r'\D','',m.group(1)))
-   if 3000<=val<=500000:price=val;break
- url=item['url'].split('#')[0].split('?')[0]
- return {'id':hashlib.sha256(url.encode()).hexdigest()[:20],'country':country,'year':year,'title':item['title'],'url':url,'price_local':price,'currency':currency,'price_eur':round(price*FX[currency],2) if price is not None and currency in FX else None,'status':'unverified','last_seen':dt.date.today().isoformat()}
+def permitted_host(url,host):
+ h=(urlsplit(url).hostname or '').lower(); return h==host or h.endswith('.'+host)
 
-def main():
- con=sqlite3.connect(DB)
+def fetch(session,url,host):
+ if not permitted_host(url,host): raise ValueError('off-domain URL blocked')
+ r=session.get(url,timeout=22,allow_redirects=True)
+ if not permitted_host(r.url,host): raise ValueError('redirect off-domain blocked')
+ if r.status_code in (401,403,429): raise RuntimeError('access_restricted_'+str(r.status_code))
+ r.raise_for_status()
+ if 'html' not in r.headers.get('content-type','text/html').lower():raise ValueError('non_html')
+ return BeautifulSoup(r.text,'html.parser')
+
+def discover(soup,source):
+ result={}; rx=re.compile(source['link_regex'],re.I)
+ for a in soup.select('a[href]'):
+  u=canonical(urljoin(source['url'],a['href']))
+  if permitted_host(u,source['host']) and rx.search(urlsplit(u).path):result[u]=a.get_text(' ',strip=True)
+ return result
+
+def extract_country(soup):
+ # Prefer actual vehicle location, never portal TLD or interface language.
+ for im in soup.select('img[alt],img[title]'):
+  desc=(im.get('alt','')+' '+im.get('title','')).strip()
+  m=re.search(r'\b(DE|NL|AT|FR|SE|CH|BE|PL|IT|ES|CZ|GB|JP|AU|US)\s*flag\b',desc,re.I)
+  if m:return m.group(1).upper()
+ text=soup.get_text(' ',strip=True)
+ for name,code in COUNTRY_NAMES.items():
+  if re.search(r'(?:Standort|Location|Ort|Localisation|Pays|Country)\s*:?\s*'+re.escape(name)+r'\b',text,re.I):return code
+ return None
+
+def parse_euro(text):
+ for m in EURO.finditer(text):
+  raw=(m.group(1) or m.group(2) or '').replace('\u00a0','').replace('\u202f','').replace(' ','')
+  # The E50 market has no credible price below 3k or above 500k. Commas are decimal only after 2 digits.
+  raw=re.sub(r'[,\.]\d{2}$','',raw)
+  digits=re.sub(r'\D','',raw)
+  if digits and 3000<=int(digits)<=500000:return int(digits)
+ return None
+
+def extract(url,soup):
+ title=(soup.title.get_text(' ',strip=True) if soup.title else '')
+ h1=soup.find('h1'); heading=h1.get_text(' ',strip=True) if h1 else title
+ text=soup.get_text(' ',strip=True)
+ # Only confirm the model from page heading/title, not incidental recommendations.
+ if not MODEL.search(heading+' '+title) or BAD.search(heading+' '+title):return None,'wrong_model'
+ # Prefer the model title for year; first registration can differ from manufacture year.
+ title_years=set(map(int,YEARS.findall(heading+' '+title)))
+ year=next(iter(title_years)) if len(title_years)==1 else None
+ if year is None:
+  for label in ('Baujahr','Year of manufacture','Année de construction','Bouwjaar'):
+   m=re.search(re.escape(label)+r'\s*:?\s*(1996|1997)',text,re.I)
+   if m:year=int(m.group(1));break
+ if year not in (1996,1997):return None,'unknown_year'
+ # Detect explicit removed/sold messages; do not assert live solely from HTTP 200.
+ inactive=bool(re.search(r'(?:this listing has now been removed|dieses inserat wurde.*entfernt|this advert has been removed|sold or otherwise removed)',text,re.I))
+ price=parse_euro(text[:max(600,len(heading)+400)])
+ if price is None:price=parse_euro(text[:2200])
+ country=extract_country(soup)
+ return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country or '??','year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':'inactive' if inactive else 'unverified','last_seen':dt.date.today().isoformat()},'accepted'
+
+def init(con):
  con.execute('CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY,country TEXT,year INTEGER,title TEXT,url TEXT,price_local REAL,currency TEXT,price_eur REAL,status TEXT,last_seen TEXT)')
  con.execute('CREATE TABLE IF NOT EXISTS snapshots (snapshot_date TEXT,id TEXT,price_eur REAL,PRIMARY KEY(snapshot_date,id))')
- accepted=0
- for country,domains in SITES.items():
-  for domain in domains:
-   for item in discover(domain):
-    print("RESULT", country, domain,
-           repr(item["title"][:120]),
-           item["url"][:150])
-    row=normalize(item,country)
-    if row:
-     accepted+=1
-     con.execute('INSERT INTO listings VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,title=excluded.title,price_local=COALESCE(excluded.price_local,listings.price_local),price_eur=COALESCE(excluded.price_eur,listings.price_eur)',row)
-     con.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)',(row['last_seen'],row['id'],row['price_eur']))
- con.commit()
+
+def save(con,row):
+ # Do not overwrite human review status, except for explicit inactive notice.
+ con.execute('''INSERT INTO listings VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen)
+ ON CONFLICT(id) DO UPDATE SET country=CASE WHEN excluded.country='??' THEN listings.country ELSE excluded.country END,
+ year=COALESCE(excluded.year,listings.year),title=excluded.title,
+ price_local=COALESCE(excluded.price_local,listings.price_local),currency=COALESCE(excluded.currency,listings.currency),
+ price_eur=COALESCE(excluded.price_eur,listings.price_eur),
+ status=CASE WHEN excluded.status='inactive' THEN 'inactive' ELSE listings.status END,
+ last_seen=excluded.last_seen''',row)
+ con.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)',(row['last_seen'],row['id'],row['price_eur']))
+
+def exports(con):
  with (ROOT/'candidates.csv').open('w',newline='',encoding='utf-8') as f:
   w=csv.writer(f);w.writerow(['country','year','title','price_local','currency','price_eur','status','url','last_seen'])
   w.writerows(con.execute('SELECT country,year,title,price_local,currency,price_eur,status,url,last_seen FROM listings ORDER BY country,year'))
- # Only verified, live listings are eligible for country price averages.
- data=list(con.execute("SELECT country,year,price_eur FROM listings WHERE status='verified_live' AND price_eur IS NOT NULL"))
  groups={}
- for c,y,p in data:groups.setdefault((c,y),[]).append(p)
+ for c,y,p in con.execute("SELECT country,year,price_eur FROM listings WHERE status='verified_live' AND country!='??' AND year IN (1996,1997) AND price_eur IS NOT NULL"):
+  groups.setdefault((c,y),[]).append(p)
  with (ROOT/'country_summary.csv').open('w',newline='',encoding='utf-8') as f:
   w=csv.writer(f);w.writerow(['country','year','n','mean_eur','median_eur','min_eur','max_eur'])
-  for (c,y),prices in sorted(groups.items()):w.writerow([c,y,len(prices),round(statistics.mean(prices),2),round(statistics.median(prices),2),min(prices),max(prices)])
- print('ACCEPTED_THIS_RUN',accepted)
- print('Candidate listings:',con.execute('SELECT count(*) FROM listings').fetchone()[0],'; verified for averages:',len(data))
+  for (c,y),ps in sorted(groups.items()):w.writerow([c,y,len(ps),round(statistics.mean(ps),2),round(statistics.median(ps),2),min(ps),max(ps)])
+ return sum(map(len,groups.values()))
+
+def main():
+ con=sqlite3.connect(DB);init(con)
+ session=requests.Session();session.headers.update(HEADERS)
+ counters=Counter(); urls={}
+ for source in SOURCES:
+  try:
+   soup=fetch(session,source['url'],source['host']); found=discover(soup,source)
+   print('PORTAL',source['name'],'candidate_links',len(found),flush=True)
+   counters['sources_ok']+=1;urls.update({u:source for u in found})
+  except Exception as e:
+   counters['sources_failed']+=1;print('PORTAL_ERROR',source['name'],str(e)[:150],flush=True)
+  time.sleep(float(os.getenv('REQUEST_DELAY','1.5')))
+ for url,source in urls.items():
+  try:
+   soup=fetch(session,url,source['host']);row,reason=extract(url,soup);counters[reason]+=1
+   if row:save(con,row);print('FOUND',row['country'],row['year'],row['price_eur'],row['url'],flush=True)
+  except Exception as e:
+   counters['detail_failed']+=1;print('DETAIL_ERROR',url,str(e)[:120],flush=True)
+  time.sleep(float(os.getenv('REQUEST_DELAY','1.5')))
+ con.commit();verified=exports(con)
+ print('RUN_SUMMARY',json.dumps(dict(counters),sort_keys=True),'stored',con.execute('SELECT COUNT(*) FROM listings').fetchone()[0],'verified_priced',verified,flush=True)
  con.close()
-if __name__=='__main__':main()
+ # Fail clearly if no source could be read; 0 listings with readable sources is an honest empty result.
+ return 1 if counters['sources_ok']==0 else 0
+
+if __name__=='__main__':sys.exit(main())
