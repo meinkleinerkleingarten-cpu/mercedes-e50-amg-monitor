@@ -21,7 +21,7 @@ from price_extract import extract_price
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'listings.sqlite3'
-USER_AGENT = 'E50AMGMarketResearch/4.2.1 (+personal noncommercial market monitor; contact via GitHub repository)'
+USER_AGENT = 'E50AMGMarketResearch/4.3 (+personal noncommercial market monitor; contact via GitHub repository)'
 HEADERS = {'User-Agent': USER_AGENT, 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
 MODEL = re.compile(r'(?<!\w)(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
 BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
@@ -159,7 +159,63 @@ def extract_country(soup):
   if re.search(r'(?:Standort|Location|Ort|Localisation|Pays|Country)\s*:?\s*'+re.escape(name)+r'\b',text,re.I):return code
  return None
 
-def extract(url,soup):
+# The portal's country is a search-location hint, not proof of the car's location.
+PORTAL_COUNTRY = {'kleinanzeigen.de':'DE', 'marktplaats.nl':'NL',
+                  'willhaben.at':'AT', 'otomoto.pl':'PL'}
+
+
+def structured_country(soup):
+ """Use explicit location in JSON-LD where possible; avoid seller-wide addresses."""
+ for tag in soup.select('script[type="application/ld+json"]'):
+  try: data=json.loads(tag.string or tag.get_text())
+  except (ValueError,TypeError): continue
+  def walk(obj):
+   if isinstance(obj,list):
+    for child in obj: yield from walk(child)
+   elif isinstance(obj,dict):
+    yield obj
+    for key in ('@graph','itemOffered','mainEntity','offers'):
+     if key in obj: yield from walk(obj[key])
+  for obj in walk(data):
+   for field in ('availableAtOrFrom','itemLocation','location'):
+    place=obj.get(field)
+    if isinstance(place,list): place=place[0] if place else None
+    if not isinstance(place,dict): continue
+    address=place.get('address',place)
+    if not isinstance(address,dict): continue
+    country=address.get('addressCountry')
+    if isinstance(country,dict): country=country.get('name')
+    if not isinstance(country,str): continue
+    country=country.strip()
+    if country.upper() in COUNTRY_NAMES.values():return country.upper()
+    for name,code in COUNTRY_NAMES.items():
+     if country.lower()==name.lower():return code
+ return None
+
+
+def country_for_listing(soup,source):
+ code=structured_country(soup) or extract_country(soup)
+ if code:return code,'listing_location'
+ fallback=PORTAL_COUNTRY.get(source['host'])
+ if fallback:return fallback,'portal_hint'
+ return '??','unknown'
+
+
+def listing_vin(soup):
+ """VIN is a strong cross-portal identity, but only when clearly labelled."""
+ text=soup.get_text(' ',strip=True)
+ m=re.search(r'(?:VIN|Fahrgestellnummer|Vehicle identification number|Chassis number|Numer VIN)\s*[:#]?\s*([A-HJ-NPR-Z0-9]{17})(?![A-Z0-9])',text,re.I)
+ return m.group(1).upper() if m else None
+
+
+def listing_observation_status(soup,price,method,inactive):
+ if inactive:return 'inactive','explicit_inactive_text'
+ if price is None:return 'unverified','price_missing'
+ # JSON-LD offer supports an advertised price, not definitive sale availability.
+ if method=='jsonld_offer':return 'observed_live','structured_offer_seen'
+ return 'unverified','weaker_price_evidence'
+
+def extract(url,soup,source):
  title=soup.title.get_text(' ',strip=True) if soup.title else ''
  h1=soup.find('h1');heading=h1.get_text(' ',strip=True) if h1 else title
  text=soup.get_text(' ',strip=True)
@@ -177,29 +233,83 @@ def extract(url,soup):
  if permitted_host(url,'otomoto.pl'):
   price=None;method='currency_unverified_PLN_skipped'
  print('PRICE_CHECK',method,price,url,flush=True)
- country=extract_country(soup)
- return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country or '??','year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':'inactive' if inactive else 'unverified','last_seen':dt.date.today().isoformat()},'accepted'
+ country,country_basis=country_for_listing(soup,source)
+ status,verification_basis=listing_observation_status(soup,price,method,inactive)
+ vin=listing_vin(soup)
+ return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country,'country_basis':country_basis,'vin':vin,'verification_basis':verification_basis,'year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':status,'last_seen':dt.date.today().isoformat()},'accepted'
 
 def init(con):
  con.execute('CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY,country TEXT,year INTEGER,title TEXT,url TEXT,price_local REAL,currency TEXT,price_eur REAL,status TEXT,last_seen TEXT)')
  con.execute('CREATE TABLE IF NOT EXISTS snapshots (snapshot_date TEXT,id TEXT,price_eur REAL,PRIMARY KEY(snapshot_date,id))')
+ columns={r[1] for r in con.execute('PRAGMA table_info(listings)')}
+ for name,kind in [('country_basis','TEXT'),('vin','TEXT'),('verification_basis','TEXT'),
+                   ('first_seen','TEXT'),('seen_days','INTEGER DEFAULT 0'),
+                   ('duplicate_group','TEXT'),('duplicate_review','TEXT')]:
+  if name not in columns:con.execute(f'ALTER TABLE listings ADD COLUMN {name} {kind}')
+
 
 def save(con,row):
- con.execute('''INSERT INTO listings VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen)
- ON CONFLICT(id) DO UPDATE SET country=CASE WHEN excluded.country='??' THEN listings.country ELSE excluded.country END,
- year=COALESCE(excluded.year,listings.year),title=excluded.title,
- price_local=COALESCE(excluded.price_local,listings.price_local),currency=COALESCE(excluded.currency,listings.currency),
- price_eur=COALESCE(excluded.price_eur,listings.price_eur),
- status=CASE WHEN excluded.status='inactive' THEN 'inactive' ELSE listings.status END,
- last_seen=excluded.last_seen''',row)
+ old=con.execute('SELECT last_seen,seen_days,status,country,country_basis FROM listings WHERE id=?',(row['id'],)).fetchone()
+ if old:
+  old_date,old_days,old_status,old_country,old_basis=old
+  days=max(1,old_days or 1)+(1 if old_date!=row['last_seen'] else 0)
+  if old_basis=='listing_location' and row['country_basis']!='listing_location':
+   row['country'],row['country_basis']=old_country,old_basis
+ else:days=1
+ status=row['status']
+ if status=='observed_live' and days>=2:
+  status='verified_live'
+  row['verification_basis']='structured_offer_seen_on_multiple_days'
+ # A previously confirmed ad may become unverifiable; do not silently retain verified status.
+ row['status']=status
+ row['seen_days']=days
+ con.execute('''INSERT INTO listings
+ (id,country,year,title,url,price_local,currency,price_eur,status,last_seen,
+  country_basis,vin,verification_basis,first_seen,seen_days)
+ VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen,
+  :country_basis,:vin,:verification_basis,:last_seen,:seen_days)
+ ON CONFLICT(id) DO UPDATE SET
+ country=excluded.country,country_basis=excluded.country_basis,
+ year=excluded.year,title=excluded.title,
+ price_local=excluded.price_local,currency=excluded.currency,price_eur=excluded.price_eur,
+ status=excluded.status,last_seen=excluded.last_seen,
+ vin=COALESCE(excluded.vin,listings.vin),verification_basis=excluded.verification_basis,
+ first_seen=COALESCE(listings.first_seen,excluded.first_seen),seen_days=excluded.seen_days''',row)
  con.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)',(row['last_seen'],row['id'],row['price_eur']))
+
+
+def flag_duplicates(con):
+ "Merge only exact VIN identities; flag same country/year/price for human review."
+ rows=con.execute('SELECT id,country,year,price_eur,vin FROM listings').fetchall()
+ con.execute('UPDATE listings SET duplicate_group=NULL,duplicate_review=NULL')
+ for id,country,year,price,vin in rows:
+  if vin:
+   # VIN is a vehicle identity, not necessarily one and the same sales listing.
+   group='vin:'+vin
+   con.execute('UPDATE listings SET duplicate_group=? WHERE id=?',(group,id))
+  if price is None or country=='??':continue
+  matches=[other for other,c,y,p,v in rows if other!=id and c==country and y==year and p==price]
+  if matches:
+   con.execute('UPDATE listings SET duplicate_review=? WHERE id=?',('possible_same_vehicle_same_year_country_price',id))
+ # Mark VIN groups as confirmed shared vehicle only when two or more listings share the VIN.
+ for vin,n in con.execute('SELECT vin,COUNT(*) FROM listings WHERE vin IS NOT NULL GROUP BY vin').fetchall():
+  if n>1:print('DUPLICATE_VIN_GROUP',vin,'listings',n,flush=True)
+ for (n,) in con.execute('SELECT COUNT(*) FROM listings WHERE duplicate_review IS NOT NULL'):
+  if n:print('DUPLICATE_REVIEW',n,'listings need manual review',flush=True)
+
 
 def exports(con):
  with (ROOT/'candidates.csv').open('w',newline='',encoding='utf-8') as f:
-  w=csv.writer(f);w.writerow(['country','year','title','price_local','currency','price_eur','status','url','last_seen'])
-  w.writerows(con.execute('SELECT country,year,title,price_local,currency,price_eur,status,url,last_seen FROM listings ORDER BY country,year'))
- groups={}
- for c,y,p in con.execute("SELECT country,year,price_eur FROM listings WHERE status='verified_live' AND country!='??' AND year IN (1996,1997) AND price_eur IS NOT NULL"):
+  w=csv.writer(f)
+  w.writerow(['country','country_basis','year','title','price_local','currency','price_eur','status','verification_basis','seen_days','duplicate_group','duplicate_review','url','last_seen'])
+  w.writerows(con.execute('''SELECT country,country_basis,year,title,price_local,currency,price_eur,status,verification_basis,seen_days,duplicate_group,duplicate_review,url,last_seen FROM listings ORDER BY country,year'''))
+ # Country-level statistics must not silently count a portal guess as verified geography.
+ # Multiple ads with the same VIN count as one vehicle; unconfirmed price matches remain separate.
+ groups={};seen=set()
+ for c,y,p,vin,identity in con.execute("SELECT country,year,price_eur,vin,id FROM listings WHERE last_seen=? AND status='verified_live' AND country_basis='listing_location' AND country!='??' AND year IN (1996,1997) AND price_eur IS NOT NULL",(dt.date.today().isoformat(),)):
+  key=('vin',vin) if vin else ('id',identity)
+  if key in seen:continue
+  seen.add(key)
   groups.setdefault((c,y),[]).append(p)
  with (ROOT/'country_summary.csv').open('w',newline='',encoding='utf-8') as f:
   w=csv.writer(f);w.writerow(['country','year','n','mean_eur','median_eur','min_eur','max_eur'])
@@ -228,13 +338,13 @@ def main():
   time.sleep(float(os.getenv('REQUEST_DELAY','1.5')))
  for url,source in urls.items():
   try:
-   soup=fetch(session,url,source['host']);row,reason=extract(url,soup);counters[reason]+=1
+   soup=fetch(session,url,source['host']);row,reason=extract(url,soup,source);counters[reason]+=1
    if row:save(con,row);print('FOUND',row['country'],row['year'],row['price_eur'],row['url'],flush=True)
   except Exception as e:
    counters['detail_failed']+=1;print('DETAIL_ERROR',url,str(e)[:120],flush=True)
   time.sleep(float(os.getenv('REQUEST_DELAY','1.5')))
- con.commit();verified=exports(con)
- print('RUN_SUMMARY',json.dumps(dict(counters),sort_keys=True),'stored',con.execute('SELECT COUNT(*) FROM listings').fetchone()[0],'verified_priced',verified,flush=True)
+ flag_duplicates(con);con.commit();verified=exports(con)
+ print('RUN_SUMMARY',json.dumps(dict(counters),sort_keys=True),'stored',con.execute('SELECT COUNT(*) FROM listings').fetchone()[0],'verified_priced',verified,'observed',con.execute("SELECT COUNT(*) FROM listings WHERE status='observed_live'").fetchone()[0],flush=True)
  con.close()
  return 1 if counters['sources_ok']==0 else 0
 
