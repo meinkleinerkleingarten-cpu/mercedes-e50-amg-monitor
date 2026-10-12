@@ -21,7 +21,7 @@ from price_extract import extract_price
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'listings.sqlite3'
-USER_AGENT = 'E50AMGMarketResearch/4.2 (+personal noncommercial market monitor; contact via GitHub repository)'
+USER_AGENT = 'E50AMGMarketResearch/4.2.1 (+personal noncommercial market monitor; contact via GitHub repository)'
 HEADERS = {'User-Agent': USER_AGENT, 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
 MODEL = re.compile(r'(?<!\w)(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
 BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
@@ -50,38 +50,97 @@ def permitted_host(url,host):
  return h==host or h.endswith('.'+host)
 
 ROBOTS = {}
-def robots_allowed(session,url,host):
- """Fail closed if robots.txt cannot be checked; cache per origin."""
- p=urlsplit(url); origin=f'{p.scheme}://{p.netloc}'
- if origin not in ROBOTS:
-  robots_url=origin+'/robots.txt'
-  try:
-   r=session.get(robots_url,timeout=15,allow_redirects=False)
-   if r.status_code != 200:
-    ROBOTS[origin]=(False,'robots_http_'+str(r.status_code))
-   else:
-    rp=RobotFileParser();rp.parse(r.text.splitlines());ROBOTS[origin]=(rp,'ok')
-  except requests.RequestException as e:
-   ROBOTS[origin]=(False,'robots_unavailable_'+type(e).__name__)
- rp,reason=ROBOTS[origin]
- if rp is False:return False,reason
- return (rp.can_fetch(USER_AGENT,url),'robots_allowed' if rp.can_fetch(USER_AGENT,url) else 'robots_disallowed')
+MAX_REDIRECTS = 5
+MAX_PER_PORTAL = max(1, int(os.getenv('MAX_PER_PORTAL', '12')))
 
-def fetch(session,url,host):
- if not permitted_host(url,host):raise ValueError('off_domain_url')
- allowed,reason=robots_allowed(session,url,host)
- if not allowed:raise RuntimeError(reason)
- r=session.get(url,timeout=22,allow_redirects=False)
- if r.status_code in (301,302,303,307,308):
-  redirect=urljoin(url,r.headers.get('Location',''))
-  if not permitted_host(redirect,host):raise ValueError('redirect_off_domain')
-  allowed,reason=robots_allowed(session,redirect,host)
-  if not allowed:raise RuntimeError(reason)
-  r=session.get(redirect,timeout=22,allow_redirects=False)
- if r.status_code in (401,403,429):raise RuntimeError('access_restricted_'+str(r.status_code))
- r.raise_for_status()
- if 'html' not in r.headers.get('content-type','text/html').lower():raise ValueError('non_html')
- return BeautifulSoup(r.text,'html.parser')
+
+def robots_allowed(session, url, host):
+ """Check robots.txt including redirects; deny on unresolved policy.
+
+ Redirects to another host are not followed by this conservative crawler.
+ A redirect is not itself a Disallow, but policy must be fetched first.
+ """
+ p = urlsplit(url)
+ origin = f'{p.scheme}://{p.netloc}'
+ if origin not in ROBOTS:
+  robots_url = origin + '/robots.txt'
+  try:
+   seen = set()
+   for _ in range(MAX_REDIRECTS + 1):
+    if robots_url in seen:
+     ROBOTS[origin] = (False, 'robots_redirect_loop')
+     break
+    seen.add(robots_url)
+    r = session.get(robots_url, timeout=15, allow_redirects=False)
+    if r.status_code in (301, 302, 303, 307, 308):
+     location = r.headers.get('Location')
+     if not location:
+      ROBOTS[origin] = (False, 'robots_redirect_missing_location')
+      break
+     target = urljoin(robots_url, location)
+     if urlsplit(target).scheme != 'https' or not permitted_host(target, host):
+      ROBOTS[origin] = (False, 'robots_redirect_off_domain')
+      break
+     robots_url = target
+     continue
+    if r.status_code == 200:
+     rp = RobotFileParser()
+     rp.parse(r.text.splitlines())
+     ROBOTS[origin] = (rp, 'ok')
+    elif r.status_code in (404, 410):
+     # RFC 9309: unavailable robots file -> no rules.
+     rp = RobotFileParser()
+     rp.parse([])
+     ROBOTS[origin] = (rp, 'robots_not_found')
+    else:
+     ROBOTS[origin] = (False, 'robots_http_' + str(r.status_code))
+    break
+   else:
+    ROBOTS[origin] = (False, 'robots_too_many_redirects')
+  except requests.RequestException as e:
+   ROBOTS[origin] = (False, 'robots_unavailable_' + type(e).__name__)
+ rp, reason = ROBOTS[origin]
+ if rp is False:
+  return False, reason
+ allowed = rp.can_fetch(USER_AGENT, url)
+ return allowed, 'robots_allowed' if allowed else 'robots_disallowed'
+
+
+def fetch(session, url, host):
+ if not permitted_host(url, host):
+  raise ValueError('off_domain_url')
+ current = url
+ for _ in range(MAX_REDIRECTS + 1):
+  allowed, reason = robots_allowed(session, current, host)
+  if not allowed:
+   raise RuntimeError(reason)
+  r = session.get(current, timeout=22, allow_redirects=False)
+  if r.status_code in (301, 302, 303, 307, 308):
+   location = r.headers.get('Location')
+   if not location:
+    raise RuntimeError('redirect_missing_location')
+   target = urljoin(current, location)
+   if urlsplit(target).scheme != 'https' or not permitted_host(target, host):
+    raise ValueError('redirect_off_domain')
+   current = target
+   continue
+  if r.status_code in (401, 403, 429):
+   raise RuntimeError('access_restricted_' + str(r.status_code))
+  r.raise_for_status()
+  if 'html' not in r.headers.get('content-type', 'text/html').lower():
+   raise ValueError('non_html')
+  return BeautifulSoup(r.text, 'html.parser')
+ raise RuntimeError('too_many_redirects')
+
+
+def plausible_e50_candidate(url, title):
+ """Strict model filter; do not infer model from generic search results."""
+ text = (title + ' ' + urlsplit(url).path.replace('-', ' ')).lower()
+ if re.search(r'\b(?:suche|gesucht|wanted|searching for|teile|parts|badge|emblem|logo|sticker|aufkleber)\b', text):
+  return False
+ if re.search(r'\b(?:e\s*55|e\s*53|e\s*63|e\s*500|gle|glc|cla|s\s*55|e\s*350|e\s*200)\b', text):
+  return False
+ return bool(MODEL.search(text))
 
 def discover(soup,source):
  found={};rx=re.compile(source['link_regex'],re.I)
@@ -157,8 +216,13 @@ def main():
    continue
   try:
    soup=fetch(session,source['url'],source['host']);found=discover(soup,source)
-   print('PORTAL',source['name'],'candidate_links',len(found),flush=True)
-   counters['sources_ok']+=1;urls.update({u:source for u in found})
+   selected=[u for u,title in found.items() if plausible_e50_candidate(u,title)]
+   print('PORTAL',source['name'],'candidate_links',len(found),'plausible',len(selected),'filtered',len(found)-len(selected),flush=True)
+   for u in selected[:MAX_PER_PORTAL]:
+    urls[u]=source
+   if len(selected)>MAX_PER_PORTAL:
+    print('PORTAL_LIMIT',source['name'],'skipped',len(selected)-MAX_PER_PORTAL,flush=True)
+   counters['sources_ok']+=1
   except Exception as e:
    counters['sources_failed']+=1;print('PORTAL_ERROR',source['name'],str(e)[:150],flush=True)
   time.sleep(float(os.getenv('REQUEST_DELAY','1.5')))
