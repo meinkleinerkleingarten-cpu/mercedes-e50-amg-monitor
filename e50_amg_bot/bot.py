@@ -29,21 +29,30 @@ def fetch(url):
  with urllib.request.urlopen(req,timeout=18) as resp: return resp.read()
 
 def discover(domain):
- q=f'"E 50 AMG" (1996 OR 1997) site:{domain}'
- url='https://www.bing.com/search?'+urllib.parse.urlencode({'q':q,'format':'rss'})
- try: root=ET.fromstring(fetch(url))
- except Exception as e:
-  print('DISCOVERY_FAILED',domain,str(e)[:140]);return []
- return [{'title':(x.findtext('title') or ''),'url':(x.findtext('link') or ''),'snippet':(x.findtext('description') or '')} for x in root.findall('./channel/item')]
+ queries=[f'"E50 AMG" site:{domain}',f'"E 50 AMG" site:{domain}',f'"W210" "AMG" site:{domain}']
+ found={}
+ for q in queries:
+  url='https://www.bing.com/search?'+urllib.parse.urlencode({'q':q,'format':'rss'})
+  try:
+   root=ET.fromstring(fetch(url))
+   items=root.findall('./channel/item')
+   print('SEARCH',domain,repr(q),'results=',len(items))
+   for x in items:
+    item={'title':(x.findtext('title') or ''),'url':(x.findtext('link') or ''),'snippet':(x.findtext('description') or '')}
+    if item['url']:found[item['url']]=item
+  except Exception as e:
+   print('DISCOVERY_FAILED',domain,repr(q),type(e).__name__,str(e)[:160])
+ print('DOMAIN_TOTAL',domain,len(found))
+ return list(found.values())
 
 def normalize(item,country):
  text=html.unescape(re.sub('<[^>]+>',' ',item['title']+' '+item['snippet']))
- if not re.search(r'\bE\s*[- ]?\s*50\s*AMG\b',text,re.I):return None
+ if not (re.search(r'\bE\s*[- ]?\s*50\s*AMG\b',text,re.I) or re.search(r'\bAMG\s*E\s*[- ]?\s*50\b',text,re.I)):return None
  if re.search(r'\b(E\s*55|E\s*500|E\s*53)\b',text,re.I):return None
  years=set(int(y) for y in re.findall(r'\b(1996|1997)\b',text))
  # Ambiguous 1996 OR 1997 search result must not be assigned to either year.
  year=next(iter(years)) if len(years)==1 else None
- if not year:return None
+ # Preserve plausible listings without a confirmed year for manual review.
  price=None;currency=CURRENCY[country]
  patterns=[r'(?<!\d)(\d{1,3}(?:[. ,]\d{3})+|\d{4,7})\s*(?:€|EUR)\b?',r'(?:€|EUR)\s*(\d{1,3}(?:[. ,]\d{3})+|\d{4,7})'] if currency=='EUR' else []
  for p in patterns:
@@ -58,11 +67,13 @@ def main():
  con=sqlite3.connect(DB)
  con.execute('CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY,country TEXT,year INTEGER,title TEXT,url TEXT,price_local REAL,currency TEXT,price_eur REAL,status TEXT,last_seen TEXT)')
  con.execute('CREATE TABLE IF NOT EXISTS snapshots (snapshot_date TEXT,id TEXT,price_eur REAL,PRIMARY KEY(snapshot_date,id))')
+ accepted=0
  for country,domains in SITES.items():
   for domain in domains:
    for item in discover(domain):
     row=normalize(item,country)
     if row:
+     accepted+=1
      con.execute('INSERT INTO listings VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen) ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen,title=excluded.title,price_local=COALESCE(excluded.price_local,listings.price_local),price_eur=COALESCE(excluded.price_eur,listings.price_eur)',row)
      con.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)',(row['last_seen'],row['id'],row['price_eur']))
  con.commit()
@@ -76,6 +87,7 @@ def main():
  with (ROOT/'country_summary.csv').open('w',newline='',encoding='utf-8') as f:
   w=csv.writer(f);w.writerow(['country','year','n','mean_eur','median_eur','min_eur','max_eur'])
   for (c,y),prices in sorted(groups.items()):w.writerow([c,y,len(prices),round(statistics.mean(prices),2),round(statistics.median(prices),2),min(prices),max(prices)])
+ print('ACCEPTED_THIS_RUN',accepted)
  print('Candidate listings:',con.execute('SELECT count(*) FROM listings').fetchone()[0],'; verified for averages:',len(data))
  con.close()
 if __name__=='__main__':main()
