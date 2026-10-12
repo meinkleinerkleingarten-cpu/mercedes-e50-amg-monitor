@@ -22,7 +22,7 @@ from price_extract import extract_price
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'listings.sqlite3'
-USER_AGENT = 'E50AMGMarketResearch/4.3 (+personal noncommercial market monitor; contact via GitHub repository)'
+USER_AGENT = 'E50AMGMarketResearch/4.5 (+personal noncommercial market monitor; contact via GitHub repository)'
 HEADERS = {'User-Agent': USER_AGENT, 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
 MODEL = re.compile(r'(?<!\w)(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
 BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
@@ -37,6 +37,7 @@ SOURCES = [
  {'name':'Marktplaats NL (experimental)', 'host':'marktplaats.nl', 'url':'https://www.marktplaats.nl/q/mercedes+e50+amg/', 'link_regex':r'/v/auto.s/[^?#]+/m\d+', 'enabled':True},
  {'name':'Willhaben AT (experimental)', 'host':'willhaben.at', 'url':'https://www.willhaben.at/iad/gebrauchtwagen/auto/gebrauchtwagenboerse?keyword=E%2050%20AMG', 'link_regex':r'/iad/gebrauchtwagen/d/[^?#]+-\d+', 'enabled':True},
  {'name':'OTOMOTO PL (experimental)', 'host':'otomoto.pl', 'url':'https://www.otomoto.pl/osobowe/q-e-50-amg', 'link_regex':r'/osobowe/oferta/[^?#]+-ID[a-zA-Z0-9]+', 'enabled':True},
+ {'name':'AutoUncle DE (experimental)', 'host':'autouncle.de', 'url':'https://www.autouncle.de/de/gebrauchtwagen/Mercedes/E50%20AMG', 'link_regex':r'/de/d/\d+-[^/?#]*e50[^/?#]*amg[^/?#]*', 'enabled':True},
  {'name':'AutoScout24 E50 (experimental)', 'host':'autoscout24.com', 'url':'https://www.autoscout24.com/lst/mercedes-benz/e-50-amg', 'link_regex':r'/offers/[a-z0-9-]+', 'enabled':True},
  {'name':'Car & Classic (403 previously)', 'host':'carandclassic.com', 'url':'https://www.carandclassic.com/list/31/e50%20amg/', 'link_regex':r'/car/C\d+', 'enabled':False},
  {'name':'mobile.de (awaiting API)', 'host':'mobile.de', 'url':'https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&dam=false&isSearchRequest=true&ms=17200%3B%3B%3BE%2050%20AMG', 'link_regex':r'/(?:auto-inserat|fahrzeuge/details)/[^?#]+', 'enabled':False},
@@ -162,7 +163,7 @@ def extract_country(soup):
 
 # The portal's country is a search-location hint, not proof of the car's location.
 PORTAL_COUNTRY = {'kleinanzeigen.de':'DE', 'marktplaats.nl':'NL',
-                  'willhaben.at':'AT', 'otomoto.pl':'PL'}
+                  'willhaben.at':'AT', 'otomoto.pl':'PL', 'autouncle.de':'DE'}
 
 
 def structured_country(soup):
@@ -266,10 +267,11 @@ def extract(url,soup,source):
  title_years=set(map(int,YEARS.findall(heading+' '+title)))
  year=next(iter(title_years)) if len(title_years)==1 else None
  if year is None:
-  for label in ('Baujahr','Year of manufacture','Année de construction','Bouwjaar'):
+  for label in ('Baujahr','Year of manufacture','Année de construction','Bouwjaar','Erstzulassung','First registration'):
    m=re.search(re.escape(label)+r'\s*:?\s*(1996|1997)',text,re.I)
    if m:year=int(m.group(1));break
  if year not in (1996,1997):return None,'unknown_year'
+ if permitted_host(url,'autouncle.de') and re.search(r'\b(?:W\s*124|A\s*124|C\s*124|S\s*124|Baureihe\s*124)\b',heading+' '+title,re.I):return None,'wrong_chassis'
  inactive=bool(re.search(r'(?:this listing has now been removed|dieses inserat wurde.*entfernt|this advert has been removed|sold or otherwise removed)',text,re.I))
  price,method=extract_price(soup)
  # Never mistake Polish zloty for EUR. Currency conversion comes in a later release.
