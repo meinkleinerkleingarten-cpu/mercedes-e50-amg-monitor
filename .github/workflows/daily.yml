@@ -1,0 +1,41 @@
+
+name: Mercedes E50 AMG Daily Search
+
+on:
+  schedule:
+    - cron: '15 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Suchbot starten
+        working-directory: e50_amg_bot
+        run: python bot.py
+
+      - name: Dashboard aktualisieren
+        working-directory: e50_amg_bot
+        run: python dashboard.py
+
+      - name: Ergebnisse speichern
+        run: |
+          git config user.name "E50 AMG Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add e50_amg_bot/listings.sqlite3 e50_amg_bot/dashboard.html
+          if ! git diff --cached --quiet; then
+            git commit -m "Update E50 AMG market data"
+            git push
+          fi
