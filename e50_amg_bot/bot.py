@@ -6,10 +6,11 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 import requests
 from bs4 import BeautifulSoup
+from price_extract import extract_price
 
 ROOT = Path(__file__).resolve().parent
 DB = ROOT / 'listings.sqlite3'
-HEADERS = {'User-Agent': 'E50AMGMarketResearch/4.0 (+personal noncommercial market monitor; contact via repository)', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
+HEADERS = {'User-Agent': 'E50AMGMarketResearch/4.1 (+personal noncommercial market monitor; contact via repository)', 'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8'}
 MODEL = re.compile(r'(?<![\w])(?:E\s*[- ]?\s*50\s*AMG|AMG\s*E\s*[- ]?\s*50)(?!\w)', re.I)
 BAD = re.compile(r'(?<!\w)(?:E\s*55\s*AMG|E\s*53\s*AMG|E\s*500|E\s*50\s*(?:badge|logo|emblem|aufkleber|sticker|teile|parts))(?!\w)', re.I)
 YEARS = re.compile(r'(?<!\d)(1996|1997)(?!\d)')
@@ -18,6 +19,8 @@ EURO = re.compile(r'(?:€\s*|\bEUR\s*)(\d[\d.\s\u00a0\u202f,]{2,12})|([\d.\s\u0
 SOURCES = [
  {'name':'Classic Trader W210','host':'classic-trader.com','url':'https://www.classic-trader.com/de/automobile/suche/mercedes-benz/e-klasse/w-210', 'link_regex':r'/automobile/inserat/[^?#]+/e-50-amg/(?:1996|1997)/\d+'},
  {'name':'Car & Classic E50 AMG','host':'carandclassic.com','url':'https://www.carandclassic.com/list/31/e50%20amg/', 'link_regex':r'/car/C\d+'},
+ {'name':'AutoScout24 E50 (experimental)','host':'autoscout24.com','url':'https://www.autoscout24.com/lst/mercedes-benz/e-50-amg', 'link_regex':r'/offers/[a-z0-9-]+'},
+ {'name':'mobile.de E50 (experimental)','host':'mobile.de','url':'https://suchen.mobile.de/fahrzeuge/search.html?vc=Car&dam=false&isSearchRequest=true&ms=17200%3B%3B%3BE%2050%20AMG', 'link_regex':r'/(?:auto-inserat|fahrzeuge/details)/[^?#]+'},
  {'name':'Car & Classic model','host':'carandclassic.com','url':'https://www.carandclassic.com/au/cars/mercedes/e-class/e50-amg', 'link_regex':r'/car/C\d+'},
 ]
 COUNTRY_NAMES = {'Deutschland':'DE','Germany':'DE','Niederlande':'NL','Netherlands':'NL','Österreich':'AT','Austria':'AT','Frankreich':'FR','France':'FR','Schweden':'SE','Sweden':'SE','Schweiz':'CH','Switzerland':'CH','Belgien':'BE','Belgium':'BE','Polen':'PL','Poland':'PL','Italien':'IT','Italy':'IT','Spanien':'ES','Spain':'ES','Tschechien':'CZ','Czechia':'CZ','United Kingdom':'GB','Großbritannien':'GB','Japan':'JP','Australia':'AU','Australien':'AU','USA':'US'}
@@ -80,8 +83,8 @@ def extract(url,soup):
  if year not in (1996,1997):return None,'unknown_year'
  # Detect explicit removed/sold messages; do not assert live solely from HTTP 200.
  inactive=bool(re.search(r'(?:this listing has now been removed|dieses inserat wurde.*entfernt|this advert has been removed|sold or otherwise removed)',text,re.I))
- price=parse_euro(text[:max(600,len(heading)+400)])
- if price is None:price=parse_euro(text[:2200])
+ price,price_method=extract_price(soup)
+ print('PRICE_CHECK',price_method,price,url,flush=True)
  country=extract_country(soup)
  return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country or '??','year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':'inactive' if inactive else 'unverified','last_seen':dt.date.today().isoformat()},'accepted'
 
