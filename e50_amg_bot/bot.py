@@ -3,6 +3,7 @@
 import csv
 import datetime as dt
 import hashlib
+import difflib
 import json
 import os
 import re
@@ -208,6 +209,48 @@ def listing_vin(soup):
  return m.group(1).upper() if m else None
 
 
+def listing_features(soup):
+ """Extract explicit mileage/color and photo URLs, never infer from page chrome."""
+ text=soup.get_text(' ',strip=True)
+ km=None
+ for pattern in (r'(?:Kilometerstand|Mileage|Kilometerstand|Kilometerstand\s*\(km\)|Laufleistung|Kilometerstand|Kilometer|Kilometrage|Kilometerstand|Przebieg)\s*:?\s*([\d.,\s]{2,12})\s*km',
+                 r'([\d.,\s]{2,12})\s*km\s*(?:Laufleistung|Mileage)'):
+  match=re.search(pattern,text,re.I)
+  if match:
+   raw=re.sub(r'\D','',match.group(1))
+   if raw and 100 <= int(raw) <= 1000000:km=int(raw);break
+ color=None
+ match=re.search(r'(?:Außenfarbe|Exterior colo[u]?r|Farbe\s+außen|Kleur|Kolor nadwozia)\s*:?\s*(schwarz|black|zwart|czarny|silber|silver|zilver|srebrny|weiß|white|wit|biały|blau|blue|blauw|niebieski|grau|grey|gray|grijs|szary|rot|red|rood|czerwony|grün|green|groen|zielony)\b',text,re.I)
+ if match:
+  mapping={'schwarz':'black','zwart':'black','czarny':'black','silber':'silver','zilver':'silver','srebrny':'silver','weiß':'white','wit':'white','biały':'white','blau':'blue','blauw':'blue','niebieski':'blue','grau':'grey','gray':'grey','grijs':'grey','szary':'grey','rot':'red','rood':'red','czerwony':'red','grün':'green','groen':'green','zielony':'green'}
+  val=match.group(1).lower();color=mapping.get(val,val)
+ images=[]
+ for tag in soup.select('script[type="application/ld+json"]'):
+  try: data=json.loads(tag.string or tag.get_text())
+  except (ValueError,TypeError):continue
+  def visit(o):
+   if isinstance(o,list):
+    for x in o:yield from visit(x)
+   elif isinstance(o,dict):
+    yield o
+    for k in ('@graph','mainEntity','itemOffered'):
+     if k in o:yield from visit(o[k])
+  for obj in visit(data):
+   typ=obj.get('@type','')
+   if isinstance(typ,list):typ=' '.join(typ)
+   if not re.search(r'Vehicle|Car|Product',str(typ),re.I):continue
+   for image in (obj.get('image') if isinstance(obj.get('image'),list) else [obj.get('image')]):
+    if isinstance(image,dict):image=image.get('url') or image.get('contentUrl')
+    if isinstance(image,str) and image.startswith('https://'):
+     images.append(image)
+ return km,color,list(dict.fromkeys(images))[:8]
+
+
+def confirmed_observation_days(con, listing_id):
+ """Count distinct days with an actual successfully fetched structured offer."""
+ return con.execute("SELECT COUNT(DISTINCT observed_date) FROM listing_observations WHERE id=? AND evidence='structured_offer_seen'",(listing_id,)).fetchone()[0]
+
+
 def listing_observation_status(soup,price,method,inactive):
  if inactive:return 'inactive','explicit_inactive_text'
  if price is None:return 'unverified','price_missing'
@@ -236,7 +279,8 @@ def extract(url,soup,source):
  country,country_basis=country_for_listing(soup,source)
  status,verification_basis=listing_observation_status(soup,price,method,inactive)
  vin=listing_vin(soup)
- return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country,'country_basis':country_basis,'vin':vin,'verification_basis':verification_basis,'year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':status,'last_seen':dt.date.today().isoformat()},'accepted'
+ mileage,color,images=listing_features(soup)
+ return {'id':hashlib.sha256(canonical(url).encode()).hexdigest()[:20], 'country':country,'country_basis':country_basis,'vin':vin,'mileage_km':mileage,'exterior_color':color,'image_urls':json.dumps(images),'verification_basis':verification_basis,'year':year,'title':heading[:300], 'url':canonical(url),'price_local':price,'currency':'EUR' if price is not None else None,'price_eur':price,'status':status,'last_seen':dt.date.today().isoformat()},'accepted'
 
 def init(con):
  con.execute('CREATE TABLE IF NOT EXISTS listings (id TEXT PRIMARY KEY,country TEXT,year INTEGER,title TEXT,url TEXT,price_local REAL,currency TEXT,price_eur REAL,status TEXT,last_seen TEXT)')
@@ -244,8 +288,9 @@ def init(con):
  columns={r[1] for r in con.execute('PRAGMA table_info(listings)')}
  for name,kind in [('country_basis','TEXT'),('vin','TEXT'),('verification_basis','TEXT'),
                    ('first_seen','TEXT'),('seen_days','INTEGER DEFAULT 0'),
-                   ('duplicate_group','TEXT'),('duplicate_review','TEXT')]:
+                   ('duplicate_group','TEXT'),('duplicate_review','TEXT'),('mileage_km','INTEGER'),('exterior_color','TEXT'),('image_urls','TEXT')]:
   if name not in columns:con.execute(f'ALTER TABLE listings ADD COLUMN {name} {kind}')
+ con.execute('CREATE TABLE IF NOT EXISTS listing_observations (id TEXT,observed_date TEXT,evidence TEXT,PRIMARY KEY(id,observed_date))')
 
 
 def save(con,row):
@@ -257,56 +302,75 @@ def save(con,row):
    row['country'],row['country_basis']=old_country,old_basis
  else:days=1
  status=row['status']
- if status=='observed_live' and days>=2:
-  status='verified_live'
-  row['verification_basis']='structured_offer_seen_on_multiple_days'
+ if status=='observed_live':
+  con.execute('INSERT OR REPLACE INTO listing_observations (id,observed_date,evidence) VALUES (?,?,?)',
+              (row['id'],row['last_seen'],'structured_offer_seen'))
+  if confirmed_observation_days(con,row['id'])>=2:
+   status='verified_live'
+   row['verification_basis']='structured_offer_seen_on_multiple_days'
  # A previously confirmed ad may become unverifiable; do not silently retain verified status.
  row['status']=status
  row['seen_days']=days
  con.execute('''INSERT INTO listings
  (id,country,year,title,url,price_local,currency,price_eur,status,last_seen,
-  country_basis,vin,verification_basis,first_seen,seen_days)
+  country_basis,vin,verification_basis,first_seen,seen_days,mileage_km,exterior_color,image_urls)
  VALUES (:id,:country,:year,:title,:url,:price_local,:currency,:price_eur,:status,:last_seen,
-  :country_basis,:vin,:verification_basis,:last_seen,:seen_days)
+  :country_basis,:vin,:verification_basis,:last_seen,:seen_days,:mileage_km,:exterior_color,:image_urls)
  ON CONFLICT(id) DO UPDATE SET
  country=excluded.country,country_basis=excluded.country_basis,
  year=excluded.year,title=excluded.title,
  price_local=excluded.price_local,currency=excluded.currency,price_eur=excluded.price_eur,
  status=excluded.status,last_seen=excluded.last_seen,
- vin=COALESCE(excluded.vin,listings.vin),verification_basis=excluded.verification_basis,
+ vin=COALESCE(excluded.vin,listings.vin),mileage_km=COALESCE(excluded.mileage_km,listings.mileage_km),
+ exterior_color=COALESCE(excluded.exterior_color,listings.exterior_color),
+ image_urls=CASE WHEN excluded.image_urls IS NOT NULL AND excluded.image_urls!='[]' THEN excluded.image_urls ELSE listings.image_urls END,
+ verification_basis=excluded.verification_basis,
  first_seen=COALESCE(listings.first_seen,excluded.first_seen),seen_days=excluded.seen_days''',row)
  con.execute('INSERT OR REPLACE INTO snapshots VALUES (?,?,?)',(row['last_seen'],row['id'],row['price_eur']))
 
 
 def flag_duplicates(con):
- "Merge only exact VIN identities; flag same country/year/price for human review."
- rows=con.execute('SELECT id,country,year,price_eur,vin FROM listings').fetchall()
+ """Confirm same VIN; score other pairs conservatively for manual review."""
  con.execute('UPDATE listings SET duplicate_group=NULL,duplicate_review=NULL')
- for id,country,year,price,vin in rows:
-  if vin:
-   # VIN is a vehicle identity, not necessarily one and the same sales listing.
-   group='vin:'+vin
-   con.execute('UPDATE listings SET duplicate_group=? WHERE id=?',(group,id))
-  if price is None or country=='??':continue
-  matches=[other for other,c,y,p,v in rows if other!=id and c==country and y==year and p==price]
-  if matches:
-   con.execute('UPDATE listings SET duplicate_review=? WHERE id=?',('possible_same_vehicle_same_year_country_price',id))
- # Mark VIN groups as confirmed shared vehicle only when two or more listings share the VIN.
- for vin,n in con.execute('SELECT vin,COUNT(*) FROM listings WHERE vin IS NOT NULL GROUP BY vin').fetchall():
-  if n>1:print('DUPLICATE_VIN_GROUP',vin,'listings',n,flush=True)
- for (n,) in con.execute('SELECT COUNT(*) FROM listings WHERE duplicate_review IS NOT NULL'):
-  if n:print('DUPLICATE_REVIEW',n,'listings need manual review',flush=True)
+ rows=[dict(zip(['id','country','year','price','vin','km','color','images','title'],r)) for r in
+       con.execute('SELECT id,country,year,price_eur,vin,mileage_km,exterior_color,image_urls,title FROM listings')]
+ for r in rows:
+  if r['vin']:
+   con.execute('UPDATE listings SET duplicate_group=? WHERE id=?',('vin:'+r['vin'],r['id']))
+ reviews=set()
+ for i,a in enumerate(rows):
+  for b in rows[i+1:]:
+   if a['vin'] and b['vin']:
+    if a['vin']==b['vin']:
+     print('DUPLICATE_VIN_PAIR',a['id'],b['id'],flush=True)
+    continue
+   if a['year']!=b['year'] or a['country']!=b['country'] or a['country']=='??':continue
+   # Contradictory attributes make a duplicate less likely.
+   if a['color'] and b['color'] and a['color']!=b['color']:continue
+   if a['km'] and b['km'] and abs(a['km']-b['km'])>2000:continue
+   evidence=[]
+   if a['price'] is not None and a['price']==b['price']:evidence.append('same_price')
+   if a['km'] and b['km'] and abs(a['km']-b['km'])<=500:evidence.append('matching_mileage')
+   if a['color'] and b['color'] and a['color']==b['color']:evidence.append('matching_color')
+   ai=set(json.loads(a['images'] or '[]'));bi=set(json.loads(b['images'] or '[]'))
+   if ai & bi:evidence.append('identical_image_url')
+   if evidence:
+    label='possible_same_vehicle:'+','.join(evidence)
+    for r in (a,b):
+     reviews.add(r['id'])
+     con.execute('UPDATE listings SET duplicate_review=? WHERE id=?',(label,r['id']))
+ print('DUPLICATE_REVIEW',len(reviews),'listings need manual review',flush=True)
 
 
 def exports(con):
  with (ROOT/'candidates.csv').open('w',newline='',encoding='utf-8') as f:
   w=csv.writer(f)
-  w.writerow(['country','country_basis','year','title','price_local','currency','price_eur','status','verification_basis','seen_days','duplicate_group','duplicate_review','url','last_seen'])
-  w.writerows(con.execute('''SELECT country,country_basis,year,title,price_local,currency,price_eur,status,verification_basis,seen_days,duplicate_group,duplicate_review,url,last_seen FROM listings ORDER BY country,year'''))
+  w.writerow(['country','country_basis','year','title','price_local','currency','price_eur','status','verification_basis','seen_days','duplicate_group','duplicate_review','mileage_km','exterior_color','image_urls','url','last_seen'])
+  w.writerows(con.execute('''SELECT country,country_basis,year,title,price_local,currency,price_eur,status,verification_basis,seen_days,duplicate_group,duplicate_review,mileage_km,exterior_color,image_urls,url,last_seen FROM listings ORDER BY country,year'''))
  # Country-level statistics must not silently count a portal guess as verified geography.
  # Multiple ads with the same VIN count as one vehicle; unconfirmed price matches remain separate.
  groups={};seen=set()
- for c,y,p,vin,identity in con.execute("SELECT country,year,price_eur,vin,id FROM listings WHERE last_seen=? AND status='verified_live' AND country_basis='listing_location' AND country!='??' AND year IN (1996,1997) AND price_eur IS NOT NULL",(dt.date.today().isoformat(),)):
+ for c,y,p,vin,identity in con.execute("SELECT country,year,price_eur,vin,id FROM listings WHERE last_seen=? AND status='verified_live' AND country_basis='listing_location' AND country!='??' AND year IN (1996,1997) AND price_eur IS NOT NULL AND duplicate_review IS NULL",(dt.date.today().isoformat(),)):
   key=('vin',vin) if vin else ('id',identity)
   if key in seen:continue
   seen.add(key)
